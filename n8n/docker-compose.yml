@@ -45,13 +45,11 @@ services:
     networks:
       - internal
 
-  # n8n Main - принимает вебхуки и кладёт в очередь
   n8n-main:
     image: n8nio/n8n:stable
     container_name: n8n-main
     restart: unless-stopped
     environment:
-      # Базовые настройки
       - N8N_HOST=${DOMAIN}
       - N8N_PROTOCOL=https
       - N8N_PORT=5678
@@ -69,63 +67,55 @@ services:
       - DB_POSTGRESDB_USER=n8n
       - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
       
-      # ===== QUEUE MODE (главное) =====
+      # Queue Mode
       - EXECUTIONS_MODE=queue
       - QUEUE_BULL_REDIS_HOST=redis
       - QUEUE_BULL_REDIS_PORT=6379
       - QUEUE_BULL_REDIS_DB=0
       - QUEUE_BULL_PREFIX=n8n
       
-      # Таймауты для очереди
-      - QUEUE_BULL_REDIS_TIMEOUT_THRESHOLD=30000  # 30 сек (увеличил с 10)
+      # Таймауты
+      - QUEUE_BULL_REDIS_TIMEOUT_THRESHOLD=30000
       - QUEUE_WORKER_LOCK_DURATION=60000
       - QUEUE_WORKER_LOCK_RENEW_TIME=10000
       - QUEUE_WORKER_STALLED_INTERVAL=30000
       - QUEUE_WORKER_MAX_STALLED_COUNT=3
       
-      # Очищение завершённых/упавших задач
+      # Очистка
       - QUEUE_BULL_REMOVE_ON_COMPLETE_COUNT=1000
       - QUEUE_BULL_REMOVE_ON_FAIL_COUNT=100
       
-      # Перенаправление ручных запусков на worker
       - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
       
-      # Таймауты выполнения
+      # ========== ИЗМЕНЕНО ==========
       - EXECUTIONS_TIMEOUT=120
-      - EXECUTIONS_CONCURRENT_MAX=50
+      - EXECUTIONS_CONCURRENT_MAX=10  # ← БЫЛО 50, СТАЛО 10
+      # ==============================
       
-      # Сохранение данных
       - EXECUTIONS_DATA_SAVE_ON_ERROR=all
       - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
       
-      # Health checks
       - QUEUE_HEALTH_CHECK_ACTIVE=true
       - QUEUE_HEALTH_CHECK_PORT=5678
       
-      # Безопасность
       - N8N_BASIC_AUTH_ACTIVE=true
       - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
       - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
       
-      # Логирование
       - N8N_LOG_LEVEL=info
       - N8N_LOG_OUTPUT=console
-      
-      # Graceful shutdown
       - N8N_GRACEFUL_SHUTDOWN_TIMEOUT=30
       
-      # Node настройки
       - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
       - N8N_GIT_NODE_DISABLE_BARE_REPOS=true
       - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
       - N8N_RUNNERS_ENABLED=true
       
-      # Таймзона
       - GENERIC_TIMEZONE=${TIMEZONE:-Europe/Moscow}
       - TZ=${TIMEZONE:-Europe/Moscow}
 
     volumes:
-      - n8n_main_1:/home/node/.n8n
+      - n8n_data:/home/node/.n8n  # ← SHARED VOLUME
     depends_on:
       postgres:
         condition: service_healthy
@@ -169,14 +159,12 @@ services:
       - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
       - "traefik.http.middlewares.redirect-to-https.redirectscheme.permanent=true"
 
-  # n8n Worker 1
   n8n-worker-1:
     image: n8nio/n8n:stable
     container_name: n8n-worker-1
     restart: unless-stopped
     command: worker
     environment:
-      # PostgreSQL
       - DB_TYPE=postgresdb
       - DB_POSTGRESDB_HOST=postgres
       - DB_POSTGRESDB_PORT=5432
@@ -185,53 +173,40 @@ services:
       - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
       - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
       
-      # ===== QUEUE MODE (должен быть ИДЕНТИЧЕН main) =====
       - EXECUTIONS_MODE=queue
       - QUEUE_BULL_REDIS_HOST=redis
       - QUEUE_BULL_REDIS_PORT=6379
       - QUEUE_BULL_REDIS_DB=0
       - QUEUE_BULL_PREFIX=n8n
       
-      # Таймауты (ИДЕНТИЧНЫ main)
       - QUEUE_BULL_REDIS_TIMEOUT_THRESHOLD=30000
       - QUEUE_WORKER_LOCK_DURATION=60000
       - QUEUE_WORKER_LOCK_RENEW_TIME=10000
       - QUEUE_WORKER_STALLED_INTERVAL=30000
       - QUEUE_WORKER_MAX_STALLED_COUNT=3
       
-      # Управление параллелизмом
       - N8N_CONCURRENCY_PRODUCTION_LIMIT=30
-      
-      # Таймауты выполнения (ИДЕНТИЧНЫ main)
       - EXECUTIONS_TIMEOUT=120
-      
-      # Сохранение данных (ИДЕНТИЧНЫ main)
       - EXECUTIONS_DATA_SAVE_ON_ERROR=all
       - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
       
-      # Health checks
       - QUEUE_HEALTH_CHECK_ACTIVE=true
       - QUEUE_HEALTH_CHECK_PORT=5681
       
-      # Логирование
       - N8N_LOG_LEVEL=info
       - N8N_LOG_OUTPUT=console
-      
-      # Graceful shutdown
       - N8N_GRACEFUL_SHUTDOWN_TIMEOUT=30
       
-      # Node настройки
       - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
       - N8N_GIT_NODE_DISABLE_BARE_REPOS=true
       - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
       - N8N_RUNNERS_ENABLED=true
       
-      # Таймзона
       - GENERIC_TIMEZONE=${TIMEZONE:-Europe/Moscow}
       - TZ=${TIMEZONE:-Europe/Moscow}
       
     volumes:
-      - n8n_worker_1:/home/node/.n8n
+      - n8n_data:/home/node/.n8n  # ← ТОТ ЖЕ SHARED VOLUME
     depends_on:
       postgres:
         condition: service_healthy
@@ -249,14 +224,12 @@ services:
       - internal
       - site_backend
 
-  # n8n Worker 2
   n8n-worker-2:
     image: n8nio/n8n:stable
     container_name: n8n-worker-2
     restart: unless-stopped
     command: worker
     environment:
-      # PostgreSQL
       - DB_TYPE=postgresdb
       - DB_POSTGRESDB_HOST=postgres
       - DB_POSTGRESDB_PORT=5432
@@ -265,53 +238,40 @@ services:
       - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
       - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
       
-      # ===== QUEUE MODE (должен быть ИДЕНТИЧЕН main) =====
       - EXECUTIONS_MODE=queue
       - QUEUE_BULL_REDIS_HOST=redis
       - QUEUE_BULL_REDIS_PORT=6379
       - QUEUE_BULL_REDIS_DB=0
       - QUEUE_BULL_PREFIX=n8n
       
-      # Таймауты (ИДЕНТИЧНЫ main)
       - QUEUE_BULL_REDIS_TIMEOUT_THRESHOLD=30000
       - QUEUE_WORKER_LOCK_DURATION=60000
       - QUEUE_WORKER_LOCK_RENEW_TIME=10000
       - QUEUE_WORKER_STALLED_INTERVAL=30000
       - QUEUE_WORKER_MAX_STALLED_COUNT=3
       
-      # Управление параллелизмом
       - N8N_CONCURRENCY_PRODUCTION_LIMIT=30
-      
-      # Таймауты выполнения (ИДЕНТИЧНЫ main)
       - EXECUTIONS_TIMEOUT=120
-      
-      # Сохранение данных (ИДЕНТИЧНЫ main)
       - EXECUTIONS_DATA_SAVE_ON_ERROR=all
       - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
       
-      # Health checks
       - QUEUE_HEALTH_CHECK_ACTIVE=true
       - QUEUE_HEALTH_CHECK_PORT=5680
       
-      # Логирование
       - N8N_LOG_LEVEL=info
       - N8N_LOG_OUTPUT=console
-      
-      # Graceful shutdown
       - N8N_GRACEFUL_SHUTDOWN_TIMEOUT=30
       
-      # Node настройки
       - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
       - N8N_GIT_NODE_DISABLE_BARE_REPOS=true
       - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
       - N8N_RUNNERS_ENABLED=true
       
-      # Таймзона
       - GENERIC_TIMEZONE=${TIMEZONE:-Europe/Moscow}
       - TZ=${TIMEZONE:-Europe/Moscow}
       
     volumes:
-      - n8n_worker_2:/home/node/.n8n
+      - n8n_data:/home/node/.n8n  # ← ТОТ ЖЕ SHARED VOLUME
     depends_on:
       postgres:
         condition: service_healthy
@@ -334,7 +294,7 @@ networks:
     external: true
   internal:
     driver: bridge
-  site_backend:       # ✅ Определяем внешнюю сеть
+  site_backend:
     external: true
     name: site_internal
 
@@ -343,9 +303,5 @@ volumes:
     driver: local
   redis_data:
     driver: local
-  n8n_main_1:
-    driver: local
-  n8n_worker_1:
-    driver: local
-  n8n_worker_2:
+  n8n_data:  # ← ОДИН shared volume для всех
     driver: local
