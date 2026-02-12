@@ -1,0 +1,169 @@
+networks:
+  proxy:
+    external: true
+  internal:
+    driver: bridge
+
+services:
+  traefik:
+    image: traefik:v3.6
+    container_name: traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./volumes/traefik/traefik.yml:/etc/traefik/traefik.yml:ro  
+      - ./volumes/traefik/config.yml:/etc/traefik/config.yml:ro   
+      - ./volumes/traefik/acme.json:/acme.json 
+      # - ./logs:/var/log                         
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+      - "--log.level=DEBUG"
+    networks:
+      - proxy
+
+
+  mariadb:
+    image: mariadb:12.1.2
+    container_name: mariadb
+    restart: unless-stopped
+    networks:
+      - proxy
+      - internal
+    ports:
+      - '127.0.0.1:33306:3306'
+    environment:
+      - TZ=Europe/Moscow
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+    volumes:
+      - ./volumes/mariadb:/var/lib/mysql
+      - ./volumes/mariadb/conf.d:/etc/mysql/conf.d
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_connections=500
+      --innodb_buffer_pool_size=512M
+      --innodb_log_file_size=128M
+      --event-scheduler=ON
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb -u root -p\"$$MYSQL_ROOT_PASSWORD\" -e 'SELECT 1;'"]
+      interval: 20s      # Повторять проверку каждые 10 секунд
+      timeout: 10s         # Ждать ответа не более 5 секунд
+      retries: 10          # Считать сервис нездоровым после 5 неудачных попыток
+      start_period: 40s   # Дать 30 секунд на первый запуск, прежде чем считать проверки
+
+
+  wordpress:
+    #build: .
+    image: wordpress:php8.4-fpm
+    container_name: wordpress
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    networks:
+      - internal
+    environment:
+      WORDPRESS_DB_HOST: mariadb:3306
+      WORDPRESS_DB_NAME: ${MYSQL_DATABASE}
+      WORDPRESS_DB_USER: ${MYSQL_USER}
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD}
+      # Дополнительные настройки WordPress
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_MEMORY_LIMIT', '256M');
+        define('WP_MAX_MEMORY_LIMIT', '512M');
+        define('FORCE_SSL_ADMIN', true);
+        if (strpos($$_SERVER['HTTP_X_FORWARDED_PROTO'], 'https') !== false) {
+          $$_SERVER['HTTPS'] = 'on';
+        }
+    volumes:
+      - ./volumes/wordpress:/var/www/html
+      - ./volumes/wordpress/uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+      - ./volumes/php-config/wordpress.ini:/usr/local/etc/php/conf.d/wordpress.ini:ro
+    # healthcheck:
+    #   test: ["CMD-SHELL", "ps aux | grep '[p]hp-fpm'"]
+    #   interval: 10s
+    #   timeout: 5s
+    #   retries: 5
+    #   start_period: 40s
+
+  nginx:
+    image: nginx:1.28-alpine
+    container_name: nginx
+    restart: unless-stopped
+    networks:
+      - proxy
+      - internal
+    # depends_on:
+    #   wordpress:
+    #     condition: service_healthy
+    depends_on:
+      wordpress:
+        condition: service_started
+    volumes:
+      - ./volumes/wordpress:/var/www/html:ro
+      - ./volumes/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./volumes/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      # Директория для FastCGI кеша (tmpfs для скорости)
+      - nginx_cache:/var/cache/nginx
+    labels:
+      - traefik.enable=true
+# основной сайт
+      - traefik.http.routers.wordpress-main.entrypoints=websecure
+      - traefik.http.routers.wordpress-main.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.wordpress-main.tls=true
+      - traefik.http.routers.wordpress-main.tls.certresolver=letsencrypt
+      - traefik.http.routers.wordpress-main.priority=10
+      - traefik.http.routers.wordpress-main.middlewares=ratelimit,wp-headers
+
+# админка
+      - traefik.http.routers.wordpress-admin.entrypoints=websecure
+      - traefik.http.routers.wordpress-admin.rule=Host(`${DOMAIN}`) && (PathPrefix(`/wp-admin`) || PathPrefix(`/wp-login.php`))
+
+      #- traefik.http.routers.wordpress-admin.rule=Host(`${DOMAIN}`) && (PathPrefix(`/wp-admin`) || Path(`/wp-login.php`))
+      - traefik.http.routers.wordpress-admin.tls=true
+      - traefik.http.routers.wordpress-admin.tls.certresolver=letsencrypt
+      - traefik.http.routers.wordpress-admin.priority=100
+      - traefik.http.routers.wordpress-admin.middlewares=wp-bruteforce,wp-headers
+    
+    # Middleware для основного сайта
+      - traefik.http.middlewares.ratelimit.ratelimit.average=20
+      - traefik.http.middlewares.ratelimit.ratelimit.burst=100
+      - traefik.http.middlewares.ratelimit.ratelimit.sourcecriterion.ipstrategy.depth=1
+      - traefik.http.middlewares.ratelimit.ratelimit.sourcecriterion.ipstrategy.excludedips=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,172.17.0.0/16,172.18.0.0/16,172.19.0.0/16,140.82.112.0/20,185.199.108.0/22,54.240.0.0/18,52.95.245.0/24
+    
+    # ЖЁСТКИЙ middleware для админки (5 req/s + burst 10)
+      - traefik.http.middlewares.wp-bruteforce.ratelimit.average=3
+      - traefik.http.middlewares.wp-bruteforce.ratelimit.burst=5
+      - traefik.http.middlewares.wp-bruteforce.ratelimit.sourcecriterion.ipstrategy.depth=1
+      - traefik.http.middlewares.wp-bruteforce.ratelimit.sourcecriterion.ipstrategy.excludedips=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16  # Только локалки для админки
+#########################################################################
+
+      # Security headers
+      - traefik.http.middlewares.wp-headers.headers.customResponseHeaders.X-Frame-Options=SAMEORIGIN
+      - traefik.http.middlewares.wp-headers.headers.customResponseHeaders.X-Content-Type-Options=nosniff
+      - traefik.http.middlewares.wp-headers.headers.customResponseHeaders.X-XSS-Protection=1; mode=block
+      - traefik.http.middlewares.wp-headers.headers.stsSeconds=31536000
+      - traefik.http.middlewares.wp-headers.headers.stsIncludeSubdomains=true
+      # Применяем middleware
+
+    healthcheck:
+      test: ["CMD", "echo", "> /dev/tcp/localhost/80"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  nginx_cache:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=1024m,uid=101,gid=101  # nginx user в alpine
