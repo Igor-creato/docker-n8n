@@ -1,0 +1,351 @@
+services:
+  redis:
+    image: redis:8.4-alpine
+    container_name: n8n-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --auto-aof-rewrite-percentage 100
+      --auto-aof-rewrite-min-size 64mb
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --maxmemory 3gb
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 300
+      --loglevel notice
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  postgres:
+    image: postgres:18-alpine
+    container_name: n8n-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: n8n
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_NON_ROOT_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n -d n8n"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  # n8n Main - принимает вебхуки и кладёт в очередь
+  n8n-main:
+    image: n8nio/n8n:stable
+    container_name: n8n-main
+    restart: unless-stopped
+    environment:
+      # Базовые настройки
+      - N8N_HOST=${DOMAIN}
+      - N8N_PROTOCOL=https
+      - N8N_PORT=5678
+      - WEBHOOK_URL=https://${DOMAIN}/
+      - N8N_EDITOR_BASE_URL=https://${DOMAIN}/
+      - N8N_PROXY_HOPS=1
+      - N8N_TRUST_PROXY=true
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      
+      # PostgreSQL
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      
+      # ===== QUEUE MODE (главное) =====
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - QUEUE_BULL_REDIS_DB=0
+      - QUEUE_BULL_PREFIX=n8n
+      
+      # Таймауты для очереди
+      - QUEUE_BULL_REDIS_TIMEOUT_THRESHOLD=30000  # 30 сек (увеличил с 10)
+      - QUEUE_WORKER_LOCK_DURATION=60000
+      - QUEUE_WORKER_LOCK_RENEW_TIME=10000
+      - QUEUE_WORKER_STALLED_INTERVAL=30000
+      - QUEUE_WORKER_MAX_STALLED_COUNT=3
+      
+      # Очищение завершённых/упавших задач
+      - QUEUE_BULL_REMOVE_ON_COMPLETE_COUNT=1000
+      - QUEUE_BULL_REMOVE_ON_FAIL_COUNT=100
+      
+      # Перенаправление ручных запусков на worker
+      - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
+      
+      # Таймауты выполнения
+      - EXECUTIONS_TIMEOUT=120
+      - EXECUTIONS_CONCURRENT_MAX=50
+      
+      # Сохранение данных
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
+      
+      # Health checks
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      - QUEUE_HEALTH_CHECK_PORT=5678
+      
+      # Безопасность
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      
+      # Логирование
+      - N8N_LOG_LEVEL=info
+      - N8N_LOG_OUTPUT=console
+      
+      # Graceful shutdown
+      - N8N_GRACEFUL_SHUTDOWN_TIMEOUT=30
+      
+      # Node настройки
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - N8N_GIT_NODE_DISABLE_BARE_REPOS=true
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - N8N_RUNNERS_ENABLED=true
+      
+      # Таймзона
+      - GENERIC_TIMEZONE=${TIMEZONE:-Europe/Moscow}
+      - TZ=${TIMEZONE:-Europe/Moscow}
+
+    volumes:
+      - n8n_main_1:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - internal
+      - proxy
+      - site_backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.n8n-http.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.n8n-http.entrypoints=web"
+      - "traefik.http.routers.n8n-http.middlewares=redirect-to-https"
+      - "traefik.http.routers.n8n-login.rule=Host(`${DOMAIN}`) && PathPrefix(`/signin`)"
+      - "traefik.http.routers.n8n-login.entrypoints=websecure"
+      - "traefik.http.routers.n8n-login.tls=true"
+      - "traefik.http.routers.n8n-login.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.n8n-login.service=n8n-service"
+      - "traefik.http.routers.n8n-login.middlewares=dashboard-ratelimit@file,security-headers@file"
+      - "traefik.http.routers.n8n.rule=Host(`${DOMAIN}`) && !PathPrefix(`/webhook`) && !PathPrefix(`/signin`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls=true"
+      - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.n8n.service=n8n-service"
+      - "traefik.http.routers.n8n.middlewares=security-headers@file"
+      - "traefik.http.routers.n8n-webhook.rule=Host(`${DOMAIN}`) && PathPrefix(`/webhook`)"
+      - "traefik.http.routers.n8n-webhook.entrypoints=websecure"
+      - "traefik.http.routers.n8n-webhook.tls=true"
+      - "traefik.http.routers.n8n-webhook.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.n8n-webhook.service=n8n-service"
+      - "traefik.http.routers.n8n-webhook.middlewares=webhook-ratelimit@file,security-headers@file"
+      - "traefik.http.services.n8n-service.loadbalancer.server.port=5678"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.permanent=true"
+
+  # n8n Worker 1
+  n8n-worker-1:
+    image: n8nio/n8n:stable
+    container_name: n8n-worker-1
+    restart: unless-stopped
+    command: worker
+    environment:
+      # PostgreSQL
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      
+      # ===== QUEUE MODE (должен быть ИДЕНТИЧЕН main) =====
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - QUEUE_BULL_REDIS_DB=0
+      - QUEUE_BULL_PREFIX=n8n
+      
+      # Таймауты (ИДЕНТИЧНЫ main)
+      - QUEUE_BULL_REDIS_TIMEOUT_THRESHOLD=30000
+      - QUEUE_WORKER_LOCK_DURATION=60000
+      - QUEUE_WORKER_LOCK_RENEW_TIME=10000
+      - QUEUE_WORKER_STALLED_INTERVAL=30000
+      - QUEUE_WORKER_MAX_STALLED_COUNT=3
+      
+      # Управление параллелизмом
+      - N8N_CONCURRENCY_PRODUCTION_LIMIT=30
+      
+      # Таймауты выполнения (ИДЕНТИЧНЫ main)
+      - EXECUTIONS_TIMEOUT=120
+      
+      # Сохранение данных (ИДЕНТИЧНЫ main)
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
+      
+      # Health checks
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      - QUEUE_HEALTH_CHECK_PORT=5681
+      
+      # Логирование
+      - N8N_LOG_LEVEL=info
+      - N8N_LOG_OUTPUT=console
+      
+      # Graceful shutdown
+      - N8N_GRACEFUL_SHUTDOWN_TIMEOUT=30
+      
+      # Node настройки
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - N8N_GIT_NODE_DISABLE_BARE_REPOS=true
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - N8N_RUNNERS_ENABLED=true
+      
+      # Таймзона
+      - GENERIC_TIMEZONE=${TIMEZONE:-Europe/Moscow}
+      - TZ=${TIMEZONE:-Europe/Moscow}
+      
+    volumes:
+      - n8n_worker_1:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      n8n-main:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5681/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - internal
+      - site_backend
+
+  # n8n Worker 2
+  n8n-worker-2:
+    image: n8nio/n8n:stable
+    container_name: n8n-worker-2
+    restart: unless-stopped
+    command: worker
+    environment:
+      # PostgreSQL
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      
+      # ===== QUEUE MODE (должен быть ИДЕНТИЧЕН main) =====
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - QUEUE_BULL_REDIS_DB=0
+      - QUEUE_BULL_PREFIX=n8n
+      
+      # Таймауты (ИДЕНТИЧНЫ main)
+      - QUEUE_BULL_REDIS_TIMEOUT_THRESHOLD=30000
+      - QUEUE_WORKER_LOCK_DURATION=60000
+      - QUEUE_WORKER_LOCK_RENEW_TIME=10000
+      - QUEUE_WORKER_STALLED_INTERVAL=30000
+      - QUEUE_WORKER_MAX_STALLED_COUNT=3
+      
+      # Управление параллелизмом
+      - N8N_CONCURRENCY_PRODUCTION_LIMIT=30
+      
+      # Таймауты выполнения (ИДЕНТИЧНЫ main)
+      - EXECUTIONS_TIMEOUT=120
+      
+      # Сохранение данных (ИДЕНТИЧНЫ main)
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
+      
+      # Health checks
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      - QUEUE_HEALTH_CHECK_PORT=5680
+      
+      # Логирование
+      - N8N_LOG_LEVEL=info
+      - N8N_LOG_OUTPUT=console
+      
+      # Graceful shutdown
+      - N8N_GRACEFUL_SHUTDOWN_TIMEOUT=30
+      
+      # Node настройки
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - N8N_GIT_NODE_DISABLE_BARE_REPOS=true
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - N8N_RUNNERS_ENABLED=true
+      
+      # Таймзона
+      - GENERIC_TIMEZONE=${TIMEZONE:-Europe/Moscow}
+      - TZ=${TIMEZONE:-Europe/Moscow}
+      
+    volumes:
+      - n8n_worker_2:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      n8n-main:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5680/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - internal
+      - site_backend
+
+networks:
+  proxy:
+    external: true
+  internal:
+    driver: bridge
+  site_backend:       # ✅ Определяем внешнюю сеть
+    external: true
+    name: site_internal
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  n8n_main_1:
+    driver: local
+  n8n_worker_1:
+    driver: local
+  n8n_worker_2:
+    driver: local
